@@ -7,3 +7,4 @@ data/**/*.parquet
 .env
 *.log
 api_keys.json
+live/state/

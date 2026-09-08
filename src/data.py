@@ -13,9 +13,15 @@ def fetch_ohlcv(
     timeframe: str = "1h",
     exchange_id: str = "binance",
     total_bars: int = 5000,
+    market_type: str = "spot",
 ) -> pd.DataFrame:
-    """取引所の1回あたりの上限(通常1000本)を超えて、ページングしながら履歴を取得する。"""
-    exchange = getattr(ccxt, exchange_id)()
+    """取引所の1回あたりの上限(通常1000本)を超えて、ページングしながら履歴を取得する。
+
+    market_type="future"で無期限先物の実売買価格(mark priceではなく約定ベース)OHLCVを
+    取得できる(symbolは"BTC/USDT:USDT"のような無期限先物表記にする)。
+    """
+    options = {"defaultType": "future"} if market_type == "future" else {}
+    exchange = getattr(ccxt, exchange_id)({"options": options})
     timeframe_ms = exchange.parse_timeframe(timeframe) * 1000
     since = exchange.milliseconds() - total_bars * timeframe_ms
 
@@ -40,11 +46,13 @@ def fetch_and_cache(
     timeframe: str,
     exchange_id: str = "binance",
     total_bars: int = 5000,
+    market_type: str = "spot",
 ) -> Path:
-    df = fetch_ohlcv(symbol, timeframe, exchange_id, total_bars=total_bars)
+    df = fetch_ohlcv(symbol, timeframe, exchange_id, total_bars=total_bars, market_type=market_type)
     DATA_DIR.mkdir(exist_ok=True)
-    safe_symbol = symbol.replace("/", "-")
-    out_path = DATA_DIR / f"{exchange_id}_{safe_symbol}_{timeframe}.csv"
+    safe_symbol = symbol.replace("/", "-").replace(":", "-")
+    suffix = "_perp" if market_type == "future" else ""
+    out_path = DATA_DIR / f"{exchange_id}_{safe_symbol}{suffix}_{timeframe}.csv"
     df.to_csv(out_path)
     return out_path
 
@@ -73,7 +81,17 @@ def fetch_funding_rate(
         if len(batch) < 1000:
             break
 
-    df = pd.DataFrame([{"timestamp": r["timestamp"], "funding_rate": r["fundingRate"]} for r in all_rows])
+    rows = []
+    for r in all_rows:
+        mark_price = r.get("info", {}).get("markPrice")
+        rows.append(
+            {
+                "timestamp": r["timestamp"],
+                "funding_rate": r["fundingRate"],
+                "mark_price": float(mark_price) if mark_price else None,
+            }
+        )
+    df = pd.DataFrame(rows)
     df = df.drop_duplicates(subset="timestamp").sort_values("timestamp")
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     return df.set_index("timestamp").tail(total_records)
@@ -99,6 +117,12 @@ if __name__ == "__main__":
         symbol = sys.argv[2] if len(sys.argv) > 2 else "BTC/USDT:USDT"
         total_records = int(sys.argv[3]) if len(sys.argv) > 3 else 3000
         path = fetch_and_cache_funding_rate(symbol, total_records=total_records)
+        print(f"saved: {path}")
+    elif len(sys.argv) > 1 and sys.argv[1] == "perp":
+        symbol = sys.argv[2] if len(sys.argv) > 2 else "BTC/USDT:USDT"
+        timeframe = sys.argv[3] if len(sys.argv) > 3 else "8h"
+        total_bars = int(sys.argv[4]) if len(sys.argv) > 4 else 6000
+        path = fetch_and_cache(symbol, timeframe, total_bars=total_bars, market_type="future")
         print(f"saved: {path}")
     else:
         symbol = sys.argv[1] if len(sys.argv) > 1 else "BTC/USDT"

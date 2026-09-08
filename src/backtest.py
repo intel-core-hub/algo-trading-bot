@@ -90,6 +90,32 @@ def run_cashflow_backtest(
     return _run_returns_backtest(cashflow_rate, signal, cost_bps, periods_per_year)
 
 
+def run_funding_carry_backtest(
+    spot_close: pd.Series,
+    perp_price: pd.Series,
+    funding_rate: pd.Series,
+    signal: pd.Series,
+    cost_bps: float = 30.0,
+    periods_per_year: int = 3 * 365,
+) -> BacktestResult:
+    """現物ロング($1) + 無期限先物ショート(証拠金$1、1倍レバレッジ)のベーシスリスクを
+    考慮したキャリー戦略バックテスト。run_cashflow_backtest(funding_rateをそのまま
+    リターンとみなす簡略版)と違い、現物と先物の価格が完全には連動しない
+    (ベーシス変動)ことによる損益も反映する。perp_priceには無期限先物の実際の約定価格
+    (fetch_ohlcv market_type="future")を渡すこと — funding rate APIのmark priceは
+    清算判定用の指数で実売買価格から乖離することがあり、そのまま使うと見せかけの
+    ベーシスリスクで結果が歪む。
+
+    投入資本は$2(現物$1 + 先物証拠金$1、無レバレッジ)とみなし、資本に対するリターンを
+    計算する: 0.5*(現物リターン - 先物価格リターン) + 0.5*funding_rate
+    (ヘッジ残差の半分 + 証拠金$1に対して発生するfundingの半分)。
+    """
+    spot_return = spot_close.pct_change().fillna(0.0)
+    perp_price_return = perp_price.pct_change().fillna(0.0)
+    combined_return = 0.5 * (spot_return - perp_price_return) + 0.5 * funding_rate
+    return _run_returns_backtest(combined_return, signal, cost_bps, periods_per_year)
+
+
 def train_test_split_by_time(df: pd.DataFrame, test_fraction: float = 0.3) -> tuple[pd.DataFrame, pd.DataFrame]:
     split_idx = int(len(df) * (1 - test_fraction))
     return df.iloc[:split_idx], df.iloc[split_idx:]
