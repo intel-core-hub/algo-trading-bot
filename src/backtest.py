@@ -23,21 +23,23 @@ class BacktestResult:
     win_rate: float
 
 
-def run_backtest(
-    close: pd.Series,
+def _run_returns_backtest(
+    raw_returns: pd.Series,
     signal: pd.Series,
-    fee_bps: float = 10.0,
-    slippage_bps: float = 5.0,
-    periods_per_year: int = 24 * 365,
+    cost_bps: float,
+    periods_per_year: int,
 ) -> BacktestResult:
-    signal = signal.reindex(close.index).fillna(0.0).clip(-1, 1)
-    price_returns = close.pct_change().fillna(0.0)
+    """signal(ポジション)と、フルロング(position=1)時の各バーのリターン系列から
+    BacktestResultを組み立てる共通ロジック。run_backtest(価格ベース)と
+    run_cashflow_backtest(ファンディングなどキャッシュフローベース)で共有する。
+    """
+    signal = signal.reindex(raw_returns.index).fillna(0.0).clip(-1, 1)
 
     position = signal.shift(1).fillna(0.0)
-    strategy_returns = position * price_returns
+    strategy_returns = position * raw_returns
 
     turnover = signal.diff().abs().fillna(signal.abs())
-    cost = turnover * (fee_bps + slippage_bps) / 10_000
+    cost = turnover * cost_bps / 10_000
     net_returns = strategy_returns - cost
 
     equity_curve = (1 + net_returns).cumprod()
@@ -62,6 +64,30 @@ def run_backtest(
         n_trades=n_trades,
         win_rate=win_rate,
     )
+
+
+def run_backtest(
+    close: pd.Series,
+    signal: pd.Series,
+    fee_bps: float = 10.0,
+    slippage_bps: float = 5.0,
+    periods_per_year: int = 24 * 365,
+) -> BacktestResult:
+    price_returns = close.pct_change().fillna(0.0)
+    return _run_returns_backtest(price_returns, signal, fee_bps + slippage_bps, periods_per_year)
+
+
+def run_cashflow_backtest(
+    cashflow_rate: pd.Series,
+    signal: pd.Series,
+    cost_bps: float = 20.0,
+    periods_per_year: int = 3 * 365,
+) -> BacktestResult:
+    """価格リターンではなく、資金調達率のような「レート型キャッシュフロー」を積み上げる
+    戦略向け(例: ファンディングキャリー)。position=1で各バーcashflow_rateをそのまま
+    受け取るとみなす。デフォルトのperiods_per_yearは資金調達が8時間毎(年1095回)の想定。
+    """
+    return _run_returns_backtest(cashflow_rate, signal, cost_bps, periods_per_year)
 
 
 def train_test_split_by_time(df: pd.DataFrame, test_fraction: float = 0.3) -> tuple[pd.DataFrame, pd.DataFrame]:
