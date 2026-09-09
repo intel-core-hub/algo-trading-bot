@@ -50,6 +50,12 @@ def apply_drawdown_stop(
 
     バックテストエンジン(backtest.run_backtest)と同じ「シグナルは翌バーから実効」の
     規約に合わせて、逐次的にエクイティを計算しながらシグナルを間引く。
+
+    ノーポジ中はエクイティが動かないため、ピークもドローダウンもブレイク発生時の水準で
+    凍結される。クールダウン明け時にそのままドローダウンを再評価すると、まだ
+    -max_drawdown を下回ったままの値で即座に再トリガーしてしまい、二度とポジションを
+    取れなくなる。そのためクールダウンが明けた時点でpeak_equityを凍結中のエクイティに
+    リセットし、そこを新たな基準にして再度ブレイクを判定できるようにする。
     """
     price_returns = close.pct_change().fillna(0.0)
     out_signal = signal.copy()
@@ -68,6 +74,8 @@ def apply_drawdown_stop(
         if cooldown_remaining > 0:
             out_signal.iloc[i] = 0.0
             cooldown_remaining -= 1
+            if cooldown_remaining == 0:
+                peak_equity = equity
         elif drawdown < -max_drawdown:
             out_signal.iloc[i] = 0.0
             cooldown_remaining = cooldown_bars
