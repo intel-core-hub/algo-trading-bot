@@ -28,10 +28,18 @@ def _run_returns_backtest(
     signal: pd.Series,
     cost_bps: float,
     periods_per_year: int,
+    charge_final_close: bool = True,
 ) -> BacktestResult:
     """signal(ポジション)と、フルロング(position=1)時の各バーのリターン系列から
     BacktestResultを組み立てる共通ロジック。run_backtest(価格ベース)と
     run_cashflow_backtest(ファンディングなどキャッシュフローベース)で共有する。
+
+    cost_bps は turnover(シグナルの変化量)1単位あたりの片道コスト。
+    0→1のエントリーで1回、1→0のイグジットでもう1回課金されるので、
+    ワンラウンドトリップの実質コストは2*cost_bpsになる。
+    charge_final_close=True(デフォルト)の場合、期間の最後にまだポジションが
+    残っていれば、それを手仕舞うコストも最終バーに追加で計上する
+    (放置すると実際には発生する決済コストを無視してリターンを過大評価してしまう)。
     """
     signal = signal.reindex(raw_returns.index).fillna(0.0).clip(-1, 1)
 
@@ -41,6 +49,13 @@ def _run_returns_backtest(
     turnover = signal.diff().abs().fillna(signal.abs())
     cost = turnover * cost_bps / 10_000
     net_returns = strategy_returns - cost
+
+    n_trades = int((signal.diff().fillna(signal) != 0).sum())
+
+    final_signal = signal.iloc[-1] if len(signal) else 0.0
+    if charge_final_close and final_signal != 0:
+        net_returns.iloc[-1] -= abs(final_signal) * cost_bps / 10_000
+        n_trades += 1
 
     equity_curve = (1 + net_returns).cumprod()
     total_return = float(equity_curve.iloc[-1] - 1)
@@ -52,7 +67,6 @@ def _run_returns_backtest(
     drawdown = equity_curve / running_max - 1
     max_drawdown = float(drawdown.min())
 
-    n_trades = int((signal.diff().fillna(signal) != 0).sum())
     win_rate = float((net_returns[position != 0] > 0).mean()) if (position != 0).any() else 0.0
 
     return BacktestResult(
@@ -86,6 +100,7 @@ def run_cashflow_backtest(
     """価格リターンではなく、資金調達率のような「レート型キャッシュフロー」を積み上げる
     戦略向け(例: ファンディングキャリー)。position=1で各バーcashflow_rateをそのまま
     受け取るとみなす。デフォルトのperiods_per_yearは資金調達が8時間毎(年1095回)の想定。
+    cost_bpsは片道コスト(ラウンドトリップは2*cost_bps。_run_returns_backtest参照)。
     """
     return _run_returns_backtest(cashflow_rate, signal, cost_bps, periods_per_year)
 
@@ -109,6 +124,8 @@ def run_funding_carry_backtest(
     投入資本は$2(現物$1 + 先物証拠金$1、無レバレッジ)とみなし、資本に対するリターンを
     計算する: 0.5*(現物リターン - 先物価格リターン) + 0.5*funding_rate
     (ヘッジ残差の半分 + 証拠金$1に対して発生するfundingの半分)。
+    cost_bpsは現物+先物の両レッグ分を合わせた片道コスト
+    (ラウンドトリップは2*cost_bps。_run_returns_backtest参照)。
     """
     spot_return = spot_close.pct_change().fillna(0.0)
     perp_price_return = perp_price.pct_change().fillna(0.0)
