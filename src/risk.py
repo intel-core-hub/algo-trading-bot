@@ -55,14 +55,23 @@ def apply_drawdown_stop(
     凍結される。クールダウン明け時にそのままドローダウンを再評価すると、まだ
     -max_drawdown を下回ったままの値で即座に再トリガーしてしまい、二度とポジションを
     取れなくなる。そのためクールダウンが明けた時点でpeak_equityを凍結中のエクイティに
-    リセットし、そこを新たな基準にして再度ブレイクを判定できるようにする。
+    リセットし、そこを新たな基準にして再度ブレイクを判定できるようにする
+    (cooldown_bars=0の場合は「cooldown_remaining>0」の分岐を一度も通らずリセットの
+    機会が無いまま同じフレーム内で即座に再判定されてしまうため、ブレイク発生時点で
+    その場でリセットする)。
     """
+    if not 0 < max_drawdown < 1:
+        raise ValueError("max_drawdown must be between 0 and 1")
+    if cooldown_bars < 0:
+        raise ValueError("cooldown_bars must be non-negative")
+
     price_returns = close.pct_change().fillna(0.0)
     out_signal = signal.copy()
 
     equity = 1.0
     peak_equity = 1.0
     cooldown_remaining = 0
+    reset_peak_when_cooldown_ends = False
     prev_out_signal = 0.0  # 前バーの(サーキットブレーカー適用後の)実効シグナル
 
     for i in range(len(signal.index)):
@@ -74,11 +83,16 @@ def apply_drawdown_stop(
         if cooldown_remaining > 0:
             out_signal.iloc[i] = 0.0
             cooldown_remaining -= 1
-            if cooldown_remaining == 0:
+            if cooldown_remaining == 0 and reset_peak_when_cooldown_ends:
                 peak_equity = equity
+                reset_peak_when_cooldown_ends = False
         elif drawdown < -max_drawdown:
             out_signal.iloc[i] = 0.0
             cooldown_remaining = cooldown_bars
+            if cooldown_bars == 0:
+                peak_equity = equity  # クールダウンが無いので即座にリセット
+            else:
+                reset_peak_when_cooldown_ends = True
         # else: 元のsignalをそのまま使う(out_signalは既にsignalのコピー)
 
         prev_out_signal = out_signal.iloc[i]

@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from risk import apply_drawdown_stop, volatility_target_position
 
@@ -94,3 +95,31 @@ def test_apply_drawdown_stop_can_retrigger_after_a_fresh_drawdown_post_cooldown(
     # bar 6 (close 50 -> 20, a fresh 60% drop) breaches drawdown again from
     # the post-cooldown baseline and should re-trigger a new cooldown
     assert (out.iloc[6:10] == 0.0).all()
+
+
+def test_apply_drawdown_stop_with_zero_cooldown_resumes_immediately():
+    # cooldown_bars=0 never enters the "cooldown_remaining > 0" branch, so the
+    # peak-equity reset has to happen at the moment of the breach itself,
+    # otherwise the very next bar would see the same frozen drawdown and
+    # retrigger forever even though trading was never actually paused.
+    close = pd.Series([100.0, 50.0, 60.0, 70.0], index=_hourly_index(4))
+    signal = pd.Series(1.0, index=close.index)
+
+    out = apply_drawdown_stop(signal, close, max_drawdown=0.2, cooldown_bars=0)
+
+    assert out.iloc[0] == 1.0
+    assert out.iloc[1] == 0.0  # trigger bar itself is flattened
+    assert out.iloc[2] == 1.0  # immediately resumes, no cooldown to wait out
+    assert out.iloc[3] == 1.0
+
+
+def test_apply_drawdown_stop_rejects_invalid_parameters():
+    close = pd.Series([100.0, 100.0], index=_hourly_index(2))
+    signal = pd.Series(1.0, index=close.index)
+
+    with pytest.raises(ValueError):
+        apply_drawdown_stop(signal, close, max_drawdown=0.0)
+    with pytest.raises(ValueError):
+        apply_drawdown_stop(signal, close, max_drawdown=1.0)
+    with pytest.raises(ValueError):
+        apply_drawdown_stop(signal, close, cooldown_bars=-1)

@@ -20,7 +20,24 @@ class BacktestResult:
     sharpe: float
     max_drawdown: float
     n_trades: int
-    win_rate: float
+    win_rate: float  # ポジションを持っているバーのうちリターンがプラスだった割合(トレード単位の勝率ではない)
+
+
+def max_drawdown_from_returns(net_returns: pd.Series) -> float:
+    """最大ドローダウンを、開始時点のエクイティ1.0を含めて計算する。
+
+    equity_curve = (1+net_returns).cumprod() は最初のバーの時点で既に
+    1回分のリターン(コスト込み)を織り込んでいるため、equity_curveの
+    cummaxをそのまま基準にすると「1本目のバー自体が最大の下落だった」場合の
+    ドローダウンが0%と誤って計算されてしまう(基準となる開始時点の1.0が
+    比較対象に含まれていないため)。先頭に1.0を明示的に加えてから計算する。
+    """
+    if len(net_returns) == 0:
+        return 0.0
+    equity = (1 + net_returns).cumprod()
+    values = pd.Series([1.0, *equity.to_numpy(dtype=float)])
+    drawdown = values / values.cummax() - 1.0
+    return float(drawdown.min())
 
 
 def _run_returns_backtest(
@@ -58,14 +75,12 @@ def _run_returns_backtest(
         n_trades += 1
 
     equity_curve = (1 + net_returns).cumprod()
-    total_return = float(equity_curve.iloc[-1] - 1)
+    total_return = float(equity_curve.iloc[-1] - 1) if len(equity_curve) else 0.0
 
     ann_factor = np.sqrt(periods_per_year)
     sharpe = float(net_returns.mean() / net_returns.std() * ann_factor) if net_returns.std() > 0 else 0.0
 
-    running_max = equity_curve.cummax()
-    drawdown = equity_curve / running_max - 1
-    max_drawdown = float(drawdown.min())
+    max_drawdown = max_drawdown_from_returns(net_returns)
 
     win_rate = float((net_returns[position != 0] > 0).mean()) if (position != 0).any() else 0.0
 
