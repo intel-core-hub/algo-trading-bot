@@ -30,13 +30,23 @@ class FakeSpotExchange:
 
 
 class FakeFuturesExchange:
-    def __init__(self, sell_filled=None, buy_filled=None, fail_sell=False, fail_buy=False, signed_position=0.0):
+    def __init__(
+        self,
+        sell_filled=None,
+        buy_filled=None,
+        fail_sell=False,
+        fail_buy=False,
+        signed_position=0.0,
+        fail_leverage=False,
+    ):
         self.sell_filled = sell_filled
         self.buy_filled = buy_filled
         self.fail_sell = fail_sell
         self.fail_buy = fail_buy
         self.signed_position = signed_position
+        self.fail_leverage = fail_leverage
         self.calls = []
+        self.leverage_calls = []
 
     def load_markets(self):
         return None
@@ -46,6 +56,11 @@ class FakeFuturesExchange:
 
     def amount_to_precision(self, symbol, amount):
         return str(amount)
+
+    def set_leverage(self, leverage, symbol):
+        self.leverage_calls.append((leverage, symbol))
+        if self.fail_leverage:
+            raise RuntimeError("leverage endpoint unavailable")
 
     def fetch_ticker(self, symbol):
         return {"last": 100.0}
@@ -133,6 +148,35 @@ def test_place_hedges_actual_spot_fill_not_ticker_notional(monkeypatch):
     assert futures.calls[0][0:2] == ("sell", 0.8)
 
 
+def test_place_carry_orders_sets_1x_leverage_before_any_order(monkeypatch):
+    spot = FakeSpotExchange(buy_filled=0.8)
+    futures = FakeFuturesExchange(sell_filled=0.8)
+    monkeypatch.setattr(execution, "get_testnet_spot_exchange", lambda: spot)
+    monkeypatch.setattr(execution, "get_testnet_futures_exchange", lambda: futures)
+
+    result = execution.place_carry_orders("BTC/USDT", 100.0, dry_run=False)
+
+    assert result.fully_positioned
+    assert futures.leverage_calls == [(1, "BTC/USDT:USDT")]
+
+
+def test_place_carry_orders_aborts_if_leverage_cannot_be_set(monkeypatch):
+    # leverage must be confirmed before any order is placed - if it can't be
+    # set, abort cleanly rather than risk trading at the account's default
+    # (possibly much higher) leverage.
+    spot = FakeSpotExchange()
+    futures = FakeFuturesExchange(fail_leverage=True)
+    monkeypatch.setattr(execution, "get_testnet_spot_exchange", lambda: spot)
+    monkeypatch.setattr(execution, "get_testnet_futures_exchange", lambda: futures)
+
+    result = execution.place_carry_orders("BTC/USDT", 100.0, dry_run=False)
+
+    assert not result.fully_positioned
+    assert not result.needs_manual_intervention  # nothing was touched, safe to just retry
+    assert spot.calls == []
+    assert futures.calls == []
+
+
 def test_perp_failure_without_exchange_exposure_unwinds_exact_spot_fill(monkeypatch):
     spot = FakeSpotExchange(buy_filled=0.8)
     futures = FakeFuturesExchange(fail_sell=True, signed_position=0.0)
@@ -207,14 +251,14 @@ def test_place_carry_orders_hedge_mismatch_flags_manual_intervention(monkeypatch
 # --- close_carry_orders: leg-failure handling ---
 
 
-def test_close_uses_recorded_base_quantities_not_current_price(monkeypatch):
+def test_close_uses_actual_exchange_quantities_not_current_price(monkeypatch):
     spot = FakeSpotExchange()
     futures = FakeFuturesExchange(buy_filled=0.8)
     monkeypatch.setattr(execution, "fetch_actual_position", lambda symbol: {"spot_amount": 0.8, "perp_amount": -0.8})
     monkeypatch.setattr(execution, "get_testnet_spot_exchange", lambda: spot)
     monkeypatch.setattr(execution, "get_testnet_futures_exchange", lambda: futures)
 
-    result = execution.close_carry_orders("BTC/USDT", 100.0, dry_run=False, spot_amount=0.8, perp_amount=0.8)
+    result = execution.close_carry_orders("BTC/USDT", 100.0, dry_run=False)
 
     assert result.fully_positioned
     assert futures.calls[0] == ("buy", 0.8, {"reduceOnly": True})
@@ -266,7 +310,7 @@ def test_close_spot_only_sells_residual_spot(monkeypatch):
     spot = FakeSpotExchange()
     monkeypatch.setattr(execution, "get_testnet_spot_exchange", lambda: spot)
 
-    result = execution.close_spot_only("BTC/USDT", spot_amount=0.8, dry_run=False)
+    result = execution.close_spot_only("BTC/USDT", dry_run=False)
 
     assert result.spot_filled
     assert ("sell", 0.8) in spot.calls
@@ -275,7 +319,7 @@ def test_close_spot_only_sells_residual_spot(monkeypatch):
 def test_close_spot_only_refuses_while_perp_exposure_exists(monkeypatch):
     monkeypatch.setattr(execution, "fetch_actual_position", lambda symbol: {"spot_amount": 0.8, "perp_amount": -0.2})
 
-    result = execution.close_spot_only("BTC/USDT", spot_amount=0.8, dry_run=False)
+    result = execution.close_spot_only("BTC/USDT", dry_run=False)
 
     assert result.needs_manual_intervention
     assert not result.spot_filled

@@ -159,7 +159,7 @@ def _run(args: argparse.Namespace) -> None:
     # 二重に積み上がってしまう。
     if state["status"] == "spot_only":
         print("recovery: residual spot-only position detected; retrying spot close")
-        result = close_spot_only(args.symbol, spot_amount=state.get("spot_amount"), dry_run=dry_run)
+        result = close_spot_only(args.symbol, dry_run=dry_run)
         if result.spot_filled:
             _clear_position_state(state)
             state["last_action_at"] = datetime.now(timezone.utc).isoformat()
@@ -217,13 +217,7 @@ def _run(args: argparse.Namespace) -> None:
             print(f"errors: {result.errors}")
 
     elif decision.action == "exit":
-        result = close_carry_orders(
-            args.symbol,
-            args.notional,
-            dry_run=dry_run,
-            spot_amount=state.get("spot_amount"),
-            perp_amount=state.get("perp_amount"),
-        )
+        result = close_carry_orders(args.symbol, args.notional, dry_run=dry_run)
         if result.fully_positioned:
             _clear_position_state(state)
             state["last_action_at"] = datetime.now(timezone.utc).isoformat()

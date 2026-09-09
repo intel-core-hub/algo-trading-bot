@@ -9,3 +9,4 @@ data/**/*.parquet
 api_keys.json
 live/state/
 *.zip
+*.patch

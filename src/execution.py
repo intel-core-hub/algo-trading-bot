@@ -12,6 +12,10 @@
 2レッグ発注は原子的ではない(取引所APIの制約上、現物と先物を単一トランザクションで
 同時に約定させることはできない)ため、以下の方針で「あいまいな失敗」に対処する。
 
+- エントリー前に必ず先物レッグのレバレッジを1倍に明示設定する(口座のデフォルト
+  レバレッジが高倍率になっていると、意図しないレバレッジ付きポジションになり
+  清算リスクが跳ね上がるため)。設定自体が失敗したら、まだ何の注文も送っていない
+  ので何もせず中断する。
 - エントリー: 現物ロングを先に建て、実際に約定した数量(注文時点の見積もりではなく
   fetch_orderで確認した約定数量)を使って先物ショートのサイズを決める(見積もり価格と
   実際の約定価格・数量がズレるとヘッジ比率が崩れるため)。先物注文がAPI例外で失敗した
@@ -22,8 +26,11 @@
   止める。ショートが存在しなければ安全に現物を売り戻す。
 - イグジット: 先物の買い戻しを先に行い、成功したら現物を売却する(現物売却が失敗しても
   残るのは低リスクな現物ロングのみ)。手仕舞い数量は「その時点の価格から再計算した
-  想定数量」ではなく、記録済み/取引所から取得した実際の保有数量を使う
-  (価格が動いた後に再計算すると、実際に持っている数量とズレて閉じ切れない)。
+  想定数量」でも「呼び出し側が記録している数量」でもなく、発注の直前にその場で
+  取引所から取り直した実際の保有数量を使う(状態ファイルの記録と実際の残高の間には
+  タイミング次第でズレが生じうるため、最終的な発注サイズは常に取引所を正とする)。
+  さらに実ポジションが「現物とショートが釣り合ったcarry」に分類できない場合
+  (現物のみ/ショートのみ/大きく不均衡)は発注せず停止する。
 
 必要な環境変数(.envに設定、Gitには含めない):
 - BINANCE_TESTNET_SPOT_API_KEY / BINANCE_TESTNET_SPOT_API_SECRET
@@ -304,16 +311,37 @@ def reconcile_state(
     return True, f"state matches exchange (saved={expected_status}, observed={observed.value}, actual={actual})"
 
 
+def _ensure_1x_leverage(futures: ccxt.Exchange, perp_symbol: str) -> None:
+    """先物レッグを必ず1倍(無レバレッジ)で建てる。
+
+    取引所口座のデフォルトレバレッジ設定(テストネットでも往々にして5〜20倍等が
+    デフォルトになっている)に任せると、「現物+先物のデルタニュートラル・キャリー」
+    のつもりが、意図せずレバレッジ付きの先物ポジションになり清算リスクが跳ね上がる。
+    毎回のエントリー前に明示的に1倍へ設定する。
+    """
+    if hasattr(futures, "set_leverage"):
+        futures.set_leverage(1, perp_symbol)
+
+
 def place_carry_orders(symbol: str, notional_usd: float, dry_run: bool = True) -> CarryExecutionResult:
     """現物ロング + 無期限先物ショートを、実際の現物約定数量でヘッジして建てる。"""
     if notional_usd <= 0:
         raise ValueError("notional_usd must be positive")
     if dry_run:
         print(f"[DRY RUN] would BUY spot {symbol} notional=${notional_usd:.2f}")
-        print(f"[DRY RUN] would SELL(short) perp {symbol} using the actual spot filled base quantity")
+        print(f"[DRY RUN] would SELL(short) perp {symbol} using the actual spot filled base quantity (1x leverage)")
         return CarryExecutionResult(dry_run=True, spot_filled=True, perp_filled=True)
 
     result = CarryExecutionResult(dry_run=False)
+    futures = get_testnet_futures_exchange()
+    perp_symbol = f"{symbol}:USDT"
+    try:
+        _ensure_1x_leverage(futures, perp_symbol)
+    except Exception as exc:  # noqa: BLE001
+        # まだ何の注文も送っていないので、失敗してもポジション状態には影響しない。
+        result.errors.append(f"failed to set 1x leverage before entry, aborting: {exc}")
+        return result
+
     spot = get_testnet_spot_exchange()
     spot_price = float(spot.fetch_ticker(symbol)["last"])
     requested_spot_amount = notional_usd / spot_price
@@ -326,8 +354,6 @@ def place_carry_orders(symbol: str, notional_usd: float, dry_run: bool = True) -
         result.errors.append(f"spot buy failed or fill could not be verified: {exc}")
         return result  # 現物すら建っていないので巻き戻し不要
 
-    futures = get_testnet_futures_exchange()
-    perp_symbol = f"{symbol}:USDT"
     try:
         perp_order_amount = _base_to_contract_amount(futures, perp_symbol, result.spot_amount)
         perp_order = futures.create_order(perp_symbol, "market", "sell", perp_order_amount)
@@ -367,46 +393,30 @@ def place_carry_orders(symbol: str, notional_usd: float, dry_run: bool = True) -
     return result
 
 
-def close_carry_orders(
-    symbol: str,
-    notional_usd: float | None = None,
-    dry_run: bool = True,
-    *,
-    spot_amount: float | None = None,
-    perp_amount: float | None = None,
-) -> CarryExecutionResult:
+def close_carry_orders(symbol: str, notional_usd: float | None = None, dry_run: bool = True) -> CarryExecutionResult:
     """キャリーポジションを手仕舞う。先物の買い戻しを先に行い、成功してから現物を
     売却する(現物売却が失敗しても残るのは低リスクな現物ロングのみにするため)。
 
-    手仕舞い数量は現在価格から再計算せず、呼び出し側が記録している実際の保有数量
-    (spot_amount/perp_amount)を優先して使う。省略時は取引所から取得した実際の
-    保有数量を使う(記録が古い/欠落していても閉じられるようにするフォールバック)。
+    手仕舞い数量は常にその場で取引所から取得した実際の保有数量を使う(現在価格からの
+    再計算はしない)。呼び出し側の状態ファイルに記録されている数量は使わない
+    — reconcile_stateで事前に一致確認していても、確認から発注までの間にズレる
+    可能性をゼロにするため、実際に閉じる量は必ずここで取引所から取り直す。
+    さらに、実際のポジションが「釣り合ったcarry」に分類できない場合(現物のみ/
+    先物のみ/大きく不均衡)は発注せず停止する。notional_usdはdry-run表示専用。
     """
     if dry_run:
-        detail = "recorded/actual filled quantities" if spot_amount is not None else f"notional hint=${notional_usd or 0:.2f}"
-        print(f"[DRY RUN] would BUY(cover) perp {symbol} and SELL spot using {detail}")
+        print(f"[DRY RUN] would BUY(cover) perp {symbol} and SELL spot using the actual held base quantities")
         return CarryExecutionResult(dry_run=True, spot_filled=True, perp_filled=True)
 
     result = CarryExecutionResult(dry_run=False)
     actual = fetch_actual_position(symbol)
-    if actual["perp_amount"] >= -1e-8:
-        result.errors.append(f"no short perp position to cover (actual={actual})")
+    if classify_actual_position(actual) != CarryAccountState.CARRY_BALANCED:
+        result.errors.append(f"refusing close: exchange position is not a balanced carry (actual={actual})")
         result.needs_manual_intervention = True
         return result
 
-    target_perp_base = float(perp_amount if perp_amount is not None else abs(actual["perp_amount"]))
-    target_spot_base = float(spot_amount if spot_amount is not None else actual["spot_amount"])
-    if target_perp_base <= 0 or target_spot_base <= 0:
-        result.errors.append(f"invalid close quantities spot={target_spot_base}, perp={target_perp_base}")
-        result.needs_manual_intervention = True
-        return result
-    if abs(actual["perp_amount"]) + 1e-8 < target_perp_base or actual["spot_amount"] + 1e-8 < target_spot_base:
-        result.errors.append(
-            f"recorded close quantity exceeds exchange position: target spot={target_spot_base}, "
-            f"perp={target_perp_base}, actual={actual}"
-        )
-        result.needs_manual_intervention = True
-        return result
+    target_perp_base = abs(actual["perp_amount"])
+    target_spot_base = actual["spot_amount"]
 
     futures = get_testnet_futures_exchange()
     perp_symbol = f"{symbol}:USDT"
@@ -441,10 +451,13 @@ def close_carry_orders(
     return result
 
 
-def close_spot_only(symbol: str, *, spot_amount: float | None = None, dry_run: bool = True) -> CarryExecutionResult:
-    """spot_only状態(先物は閉じたが現物売却が残っている等)の復旧専用処理。"""
+def close_spot_only(symbol: str, dry_run: bool = True) -> CarryExecutionResult:
+    """spot_only状態(先物は閉じたが現物売却が残っている等)の復旧専用処理。
+
+    close_carry_orders同様、手仕舞い数量は常にその場で取引所から取り直す。
+    """
     if dry_run:
-        print(f"[DRY RUN] would SELL residual spot {symbol} amount={spot_amount if spot_amount is not None else 'actual'}")
+        print(f"[DRY RUN] would SELL residual spot {symbol} using the actual held base quantity")
         return CarryExecutionResult(dry_run=True, spot_filled=True, perp_filled=True)
 
     result = CarryExecutionResult(dry_run=False, perp_filled=True)
@@ -453,10 +466,9 @@ def close_spot_only(symbol: str, *, spot_amount: float | None = None, dry_run: b
         result.errors.append(f"refusing spot-only recovery while perp exposure exists: {actual}")
         result.needs_manual_intervention = True
         return result
-    target = float(spot_amount if spot_amount is not None else actual["spot_amount"])
-    if target <= 0 or actual["spot_amount"] + 1e-8 < target:
-        result.errors.append(f"invalid residual spot close target={target}, actual={actual['spot_amount']}")
-        result.needs_manual_intervention = True
+    target = actual["spot_amount"]
+    if target <= 0:
+        result.spot_filled = True  # 既に売却済み(何もしない)
         return result
     try:
         spot = get_testnet_spot_exchange()

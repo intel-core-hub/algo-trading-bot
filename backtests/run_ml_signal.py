@@ -64,6 +64,15 @@ def make_model() -> RandomForestClassifier:
     )
 
 
+def purge_training_boundary(train: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    """train窓末尾のhorizon本を切り落とす(そのラベルがtest側の価格を参照しているため)。"""
+    if horizon <= 0:
+        return train
+    if len(train) <= horizon:
+        raise ValueError("train window must be longer than prediction horizon")
+    return train.iloc[:-horizon]
+
+
 def walk_forward_ml(df: pd.DataFrame, train_bars: int, test_bars: int) -> WalkForwardReport:
     if train_bars <= HORIZON:
         raise ValueError(f"train_bars must be greater than HORIZON={HORIZON}")
@@ -84,8 +93,7 @@ def walk_forward_ml(df: pd.DataFrame, train_bars: int, test_bars: int) -> WalkFo
     while start + train_bars + test_bars <= n:
         train = data.iloc[start : start + train_bars]
         test = data.iloc[start + train_bars : start + train_bars + test_bars]
-        # train窓末尾のHORIZON本はラベルがtest側の価格を参照しているのでfitから除外する
-        fit_train = train.iloc[:-HORIZON]
+        fit_train = purge_training_boundary(train, HORIZON)
 
         model = make_model()
         model.fit(fit_train[FEATURE_COLUMNS], fit_train["label"])
