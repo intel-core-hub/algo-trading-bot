@@ -20,7 +20,7 @@ class BacktestResult:
     sharpe: float
     max_drawdown: float
     n_trades: int
-    win_rate: float  # ポジションを持っているバーのうちリターンがプラスだった割合(トレード単位の勝率ではない)
+    win_rate: float  # entry→exitのクローズド・トレード単位でネットリターンがプラスだった割合
 
 
 def max_drawdown_from_returns(net_returns: pd.Series) -> float:
@@ -38,6 +38,74 @@ def max_drawdown_from_returns(net_returns: pd.Series) -> float:
     values = pd.Series([1.0, *equity.to_numpy(dtype=float)])
     drawdown = values / values.cummax() - 1.0
     return float(drawdown.min())
+
+
+def _closed_trade_returns(
+    raw_returns: pd.Series,
+    signal: pd.Series,
+    cost_bps: float,
+    charge_final_close: bool,
+) -> list[float]:
+    """entry→exit単位の(コスト込み)ネットリターンをtradeごとに返す。
+
+    以前は「ポジションを持っているバーのうちリターンがプラスだった割合」をwin_rate
+    としていたが、これはバー単位の指標であってトレード単位の勝率ではない
+    (例: +10%,+10%と2バー連続で勝った後に-50%で決済されるtradeは、
+    バー単位では2勝1敗に見えても、trade自体は明確な負けである)。
+
+    同符号内でのサイズ変更は同一tradeの継続として扱い、反転(+→-やその逆)は
+    旧tradeの決済と新tradeの建玉に分割する。charge_final_close=Trueの場合、
+    期間終了時点で未決済のtradeも(_run_returns_backtestと同じ規約で)強制決済
+    したものとして含める。
+    """
+    if len(signal) == 0:
+        return []
+
+    cost_rate = cost_bps / 10_000
+    trade_returns: list[float] = []
+    active_factor: float | None = None
+
+    def apply_component(component: float) -> None:
+        nonlocal active_factor
+        if active_factor is None:
+            active_factor = 1.0
+        active_factor *= 1.0 + component
+
+    def close_active() -> None:
+        nonlocal active_factor
+        if active_factor is not None:
+            trade_returns.append(active_factor - 1.0)
+            active_factor = None
+
+    for i in range(len(signal)):
+        prev = float(signal.iloc[i - 1]) if i > 0 else 0.0
+        curr = float(signal.iloc[i])
+        prev_sign = int(np.sign(prev))
+        curr_sign = int(np.sign(curr))
+        market_pnl = prev * float(raw_returns.iloc[i])
+
+        if prev_sign == curr_sign:
+            if curr_sign != 0:
+                # 保有継続(同符号内のリサイズ含む): 市場損益 + リサイズのコスト
+                apply_component(market_pnl - abs(curr - prev) * cost_rate)
+        elif prev_sign == 0 and curr_sign != 0:
+            # 新規エントリー: このバーの実効ポジションはまだprev=0なので市場損益は無し
+            apply_component(-abs(curr) * cost_rate)
+        elif prev_sign != 0 and curr_sign == 0:
+            # イグジット: 保有していた分の市場損益 + 決済コストを旧tradeに計上して確定
+            apply_component(market_pnl - abs(prev) * cost_rate)
+            close_active()
+        else:
+            # 反転(+→- または -→+): 旧tradeの決済 + 新tradeのエントリーに分割
+            apply_component(market_pnl - abs(prev) * cost_rate)
+            close_active()
+            apply_component(-abs(curr) * cost_rate)
+
+        if i == len(signal) - 1 and curr_sign != 0 and charge_final_close:
+            apply_component(-abs(curr) * cost_rate)
+            close_active()
+
+    return trade_returns
 
 
 def _run_returns_backtest(
@@ -82,7 +150,8 @@ def _run_returns_backtest(
 
     max_drawdown = max_drawdown_from_returns(net_returns)
 
-    win_rate = float((net_returns[position != 0] > 0).mean()) if (position != 0).any() else 0.0
+    trade_returns = _closed_trade_returns(raw_returns, signal, cost_bps, charge_final_close)
+    win_rate = float(np.mean([r > 0 for r in trade_returns])) if trade_returns else 0.0
 
     return BacktestResult(
         equity_curve=equity_curve,
