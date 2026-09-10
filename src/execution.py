@@ -318,9 +318,16 @@ def _ensure_1x_leverage(futures: ccxt.Exchange, perp_symbol: str) -> None:
     デフォルトになっている)に任せると、「現物+先物のデルタニュートラル・キャリー」
     のつもりが、意図せずレバレッジ付きの先物ポジションになり清算リスクが跳ね上がる。
     毎回のエントリー前に明示的に1倍へ設定する。
+
+    取引所オブジェクトが`set_leverage`自体を持たない場合、以前は何もせず黙って
+    スキップしていた(=レバレッジが未確認のまま発注に進んでしまう、安全機構が
+    無言で無効化される経路)。これも他の失敗と同様に明示的なエラーとして扱い、
+    呼び出し元(place_carry_orders)の既存のtry/exceptで「まだ何も注文していない
+    ので中断する」という同じ安全なパスに合流させる。
     """
-    if hasattr(futures, "set_leverage"):
-        futures.set_leverage(1, perp_symbol)
+    if not hasattr(futures, "set_leverage"):
+        raise RuntimeError(f"exchange does not support set_leverage; cannot guarantee 1x leverage for {perp_symbol}")
+    futures.set_leverage(1, perp_symbol)
 
 
 def place_carry_orders(symbol: str, notional_usd: float, dry_run: bool = True) -> CarryExecutionResult:

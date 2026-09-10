@@ -177,6 +177,37 @@ def test_place_carry_orders_aborts_if_leverage_cannot_be_set(monkeypatch):
     assert futures.calls == []
 
 
+def test_place_carry_orders_aborts_if_exchange_has_no_set_leverage_method(monkeypatch):
+    # An exchange object with no set_leverage() at all must be treated the same
+    # as any other failure to confirm 1x leverage: abort before touching either
+    # leg, rather than silently skipping the leverage guarantee and proceeding
+    # at whatever leverage the account happens to default to.
+    class FuturesExchangeWithoutLeverageControl:
+        def __init__(self):
+            self.calls = []
+
+        def fetch_ticker(self, symbol):
+            return {"last": 100.0}
+
+        def create_order(self, symbol, order_type, side, amount, params=None):
+            self.calls.append((side, amount, params))
+            return {"id": "perp-sell", "status": "closed", "amount": amount, "filled": amount, "remaining": 0.0}
+
+    spot = FakeSpotExchange()
+    futures = FuturesExchangeWithoutLeverageControl()
+    assert not hasattr(futures, "set_leverage")
+    monkeypatch.setattr(execution, "get_testnet_spot_exchange", lambda: spot)
+    monkeypatch.setattr(execution, "get_testnet_futures_exchange", lambda: futures)
+
+    result = execution.place_carry_orders("BTC/USDT", 100.0, dry_run=False)
+
+    assert not result.fully_positioned
+    assert not result.needs_manual_intervention  # nothing was touched, safe to just retry
+    assert any("set_leverage" in e for e in result.errors)
+    assert spot.calls == []
+    assert futures.calls == []
+
+
 def test_perp_failure_without_exchange_exposure_unwinds_exact_spot_fill(monkeypatch):
     spot = FakeSpotExchange(buy_filled=0.8)
     futures = FakeFuturesExchange(fail_sell=True, signed_position=0.0)
