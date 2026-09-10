@@ -16,7 +16,9 @@
 標準偏差0.04%/8hまで下がり、現実の裁定コストに近い水準になる)。
 
 BTC/ETH/SOL/BNBの4銘柄で頑健性を確認し、証拠金/清算リスクの目安として先物価格の
-急変動幅も出力する。
+急変動幅も出力する。spot/perp/fundingの3系列は、秒単位に丸めたタイムスタンプの
+完全一致で突き合わせる(ffillだとタイムスタンプのミリ秒ジッター次第で1本前の値を
+誤って引き継ぐ可能性があるため)。
 
 Usage:
     python backtests/run_funding_carry.py
@@ -44,7 +46,14 @@ from backtest import (  # noqa: E402
 import funding_carry  # noqa: E402
 
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
-COST_BPS = 30.0  # 現物+先物 両レッグ分の概算コスト
+
+# 30bpsは現物+先物の両レッグ合わせた片道コストの想定(例: 各レッグ15bps)。
+# run_funding_carry_backtestはリターンを投入資本$2(現物$1+先物証拠金$1)基準で
+# 計算するため、同じ基準に揃えるにはコストも資本$2に対する比率に直す必要がある。
+# 30bpsをそのまま使うと、$1ノーション基準のコストを$2資本の分母にぶつけることになり、
+# 実質コストを2倍に過大計上してしまう。
+TOTAL_LEG_COST_BPS = 30.0
+PORTFOLIO_COST_BPS = TOTAL_LEG_COST_BPS / 2.0
 
 
 def load(symbol: str) -> pd.DataFrame | None:
@@ -59,11 +68,23 @@ def load(symbol: str) -> pd.DataFrame | None:
     spot = pd.read_csv(spot_path, index_col="timestamp", parse_dates=True)
     perp = pd.read_csv(perp_path, index_col="timestamp", parse_dates=True)
 
-    df = pd.DataFrame(index=spot.index)
-    df["spot_close"] = spot["close"]
-    df["perp_close"] = perp["close"].reindex(df.index, method="ffill")
-    df["funding_rate"] = funding["funding_rate"].reindex(df.index, method="ffill")
-    return df.dropna(subset=["funding_rate", "perp_close", "spot_close"])
+    # fundingのタイムスタンプは取引所側の記録タイミングでミリ秒単位のジッターがあり、
+    # spot/perpのローソク足(ぴったり境界)とffillで素朴に突き合わせると、ジッターが
+    # 境界の直後に出た回だけ1本前(8時間前)の値を誤って拾ってしまうことがある。
+    # 秒単位に丸めてから完全一致でつき合わせることで、値を1本も捨てずに正しく揃える。
+    funding = funding.copy()
+    funding.index = funding.index.round("s")
+
+    df = pd.concat(
+        [
+            spot["close"].rename("spot_close"),
+            perp["close"].rename("perp_close"),
+            funding["funding_rate"],
+        ],
+        axis=1,
+        join="inner",
+    ).dropna()
+    return df.sort_index()
 
 
 def evaluate(label: str, result) -> None:
@@ -78,6 +99,9 @@ def main() -> None:
         df = load(symbol)
         if df is None:
             print(f"skip {symbol}: data not found (run src/data.py first)")
+            continue
+        if len(df) < 30:
+            print(f"skip {symbol}: only {len(df)} aligned 8h observations after joining")
             continue
 
         # 証拠金/清算リスクの目安: 先物価格の急変動幅(全期間)
@@ -101,11 +125,15 @@ def main() -> None:
             conditional = funding_carry.generate_signal(split_df["funding_rate"], window=21, threshold=0.0)
 
             for sig_name, signal in [("always_on", always_on), ("conditional(7d avg>0)", conditional)]:
-                naive = run_cashflow_backtest(split_df["funding_rate"], signal, cost_bps=COST_BPS)
+                naive = run_cashflow_backtest(split_df["funding_rate"], signal, cost_bps=PORTFOLIO_COST_BPS)
                 evaluate(f"{sig_name} naive(funding only)", naive)
 
                 basis_aware = run_funding_carry_backtest(
-                    split_df["spot_close"], split_df["perp_close"], split_df["funding_rate"], signal, cost_bps=COST_BPS
+                    split_df["spot_close"],
+                    split_df["perp_close"],
+                    split_df["funding_rate"],
+                    signal,
+                    cost_bps=PORTFOLIO_COST_BPS,
                 )
                 evaluate(f"{sig_name} basis-aware(spot+perp)", basis_aware)
 

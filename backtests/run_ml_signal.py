@@ -10,6 +10,11 @@
 - test窓はモデルの予測をそのままシグナルとして使う(test窓は完全にout-of-sample)
 - test窓ごとにモデルを再学習して次のtest窓へロールしていく
 
+注意(ラベルリーク対策): ラベルはclose.shift(-HORIZON)、つまりHORIZON本先の未来の
+終値を使って作る。train窓の末尾HORIZON本はそのラベルの一部がtest窓側の価格を
+参照してしまう(train/testの境界をまたぐラベルリーク)ため、学習には使わずtrain窓の
+末尾HORIZON本を切り落としてから(purgeしてから)fitする。
+
 Usage:
     python backtests/run_ml_signal.py
 data/ に事前に `python src/data.py <symbol> 1h 20000` でキャッシュしたOHLCVが必要。
@@ -59,7 +64,19 @@ def make_model() -> RandomForestClassifier:
     )
 
 
+def purge_training_boundary(train: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    """train窓末尾のhorizon本を切り落とす(そのラベルがtest側の価格を参照しているため)。"""
+    if horizon <= 0:
+        return train
+    if len(train) <= horizon:
+        raise ValueError("train window must be longer than prediction horizon")
+    return train.iloc[:-horizon]
+
+
 def walk_forward_ml(df: pd.DataFrame, train_bars: int, test_bars: int) -> WalkForwardReport:
+    if train_bars <= HORIZON:
+        raise ValueError(f"train_bars must be greater than HORIZON={HORIZON}")
+
     feat = build_features(df)
     label = build_labels(df["close"], horizon=HORIZON, threshold=LABEL_THRESHOLD)
 
@@ -76,9 +93,10 @@ def walk_forward_ml(df: pd.DataFrame, train_bars: int, test_bars: int) -> WalkFo
     while start + train_bars + test_bars <= n:
         train = data.iloc[start : start + train_bars]
         test = data.iloc[start + train_bars : start + train_bars + test_bars]
+        fit_train = purge_training_boundary(train, HORIZON)
 
         model = make_model()
-        model.fit(train[FEATURE_COLUMNS], train["label"])
+        model.fit(fit_train[FEATURE_COLUMNS], fit_train["label"])
 
         train_signal = hold_for_horizon(model.predict(train[FEATURE_COLUMNS]), train.index, HORIZON)
         train_result = run_backtest(train["close"], train_signal)
@@ -92,7 +110,7 @@ def walk_forward_ml(df: pd.DataFrame, train_bars: int, test_bars: int) -> WalkFo
         folds.append(
             Fold(
                 train_start=train.index[0],
-                train_end=train.index[-1],
+                train_end=fit_train.index[-1],
                 test_start=test.index[0],
                 test_end=test.index[-1],
                 best_params=top_features,
@@ -140,13 +158,11 @@ def main() -> None:
         report = walk_forward_ml(df, TRAIN_BARS, TEST_BARS)
         summarize(symbol, report)
 
-        n = len(df)
-        test_slices = []
-        start = 0
-        while start + TRAIN_BARS + TEST_BARS <= n:
-            test_slices.append(df.iloc[start + TRAIN_BARS : start + TRAIN_BARS + TEST_BARS])
-            start += TEST_BARS
-        bh_returns = [run_backtest(s["close"], pd.Series(1.0, index=s.index)).returns for s in test_slices]
+        # ML foldと全く同じOOS期間でbuy-and-holdを計算する(端数バーのズレを避ける)
+        bh_returns = []
+        for fold in report.folds:
+            test_slice = df.loc[fold.test_start : fold.test_end]
+            bh_returns.append(run_backtest(test_slice["close"], pd.Series(1.0, index=test_slice.index)).returns)
         bh_equity = (1 + pd.concat(bh_returns)).cumprod()
         print(f"{'buy_and_hold':10s} {'':10s}| oos_return={float(bh_equity.iloc[-1] - 1):+.2%}")
 

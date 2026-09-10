@@ -8,3 +8,6 @@ data/**/*.parquet
 *.log
 api_keys.json
 live/state/
+*.zip
+*.patch
+.pytest_cache/

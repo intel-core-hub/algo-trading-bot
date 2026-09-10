@@ -1,5 +1,8 @@
 """ファンディング・キャリーの現在のシグナルを確認し、(デフォルトはdry-runで)発注する。
 
+liveパスはfail-closed: 発注前に必ず取引所の実状態と照合し、状態ファイルはatomicに
+書き込み、同じ銘柄を同時に複数プロセスが操作しないようロックを取る。
+
 backtests/run_funding_carry.pyの検証結果に基づく設計上の注意点:
 - OOSでプラスだったのは「常に建てっぱなし」のalways_on_carryであり、直近7日平均を
   日次で評価して出し入れするconditional_carryはOOSでコスト負けしていた
@@ -8,13 +11,6 @@ backtests/run_funding_carry.pyの検証結果に基づく設計上の注意点:
   再現してしまう。**週1回程度の実行を想定**し、かつ直近でenter/exitした後
   min_hold_daysが経過するまでは反対方向のアクションを取らない、というクールダウンを
   入れている。
-- 実行状態(建玉があるか)はJSON(live/state/)で管理しているが、プロセス停止・手動注文・
-  部分約定・取引所側のリセットなどでJSONと実際の口座が食い違いうる。--liveでの実行時は
-  発注前に必ず取引所の実残高/建玉と状態ファイルを突き合わせ(execution.reconcile_state)、
-  食い違いがあれば自動売買を止める。
-- 2レッグ発注は原子的ではないため、片方だけ約定する状態が起こりうる
-  (詳細はsrc/execution.pyのモジュールdocstring参照)。needs_manual_intervention=Trueが
-  一度立ったら、このスクリプトは人手で状態ファイルを確認・修正するまで自動売買を止める。
 
 Usage:
     python live/check_and_trade_carry.py --symbol BTC/USDT --notional 100
@@ -25,9 +21,13 @@ Usage:
 (本番/実資金のキーはこのスクリプトでは意図的にサポートしない)。
 """
 
+from __future__ import annotations
+
 import argparse
 import json
+import os
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -35,7 +35,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
 
 from data import fetch_funding_rate  # noqa: E402
-from execution import close_carry_orders, decide_carry_action, place_carry_orders, reconcile_state  # noqa: E402
+from execution import (  # noqa: E402
+    close_carry_orders,
+    close_spot_only,
+    decide_carry_action,
+    place_carry_orders,
+    reconcile_state,
+)
 
 STATE_DIR = ROOT / "live" / "state"
 WINDOW = 21  # 21本 x 8h = 7日(strategies/funding_carry.pyと合わせる)
@@ -45,20 +51,60 @@ DEFAULT_STATE = {
     "needs_manual_intervention": False,
     "last_action_at": None,
     "last_error": None,
+    "spot_amount": None,
+    "perp_amount": None,
+    "spot_order_id": None,
+    "perp_order_id": None,
 }
 
 
+def _state_path(symbol: str) -> Path:
+    return STATE_DIR / f"{symbol.replace('/', '-')}.json"
+
+
 def load_state(symbol: str) -> dict:
-    path = STATE_DIR / f"{symbol.replace('/', '-')}.json"
+    path = _state_path(symbol)
     if path.exists():
         return {**DEFAULT_STATE, **json.loads(path.read_text())}
     return dict(DEFAULT_STATE)
 
 
 def save_state(symbol: str, state: dict) -> None:
+    """プロセスがクラッシュしても壊れたJSONが残らないよう、一時ファイルに書いてから
+    atomicにリネームする。"""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    path = STATE_DIR / f"{symbol.replace('/', '-')}.json"
-    path.write_text(json.dumps(state, indent=2))
+    path = _state_path(symbol)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    payload = json.dumps(state, indent=2, sort_keys=True) + "\n"
+    tmp.write_text(payload)
+    os.replace(tmp, path)
+
+
+@contextmanager
+def state_lock(symbol: str):
+    """同じ銘柄を複数プロセスが同時に操作しないための簡易ロック。
+
+    fcntl/msvcrtなどOS依存のファイルロックAPIは使わず、`open(..., "x")`
+    (作成時に既存なら失敗する排他的作成)だけで実装する(Windows/Unix両対応、
+    追加の依存ライブラリも不要)。プロセスが異常終了するとロックファイルが
+    残ったままになりうるので、その場合は中身(PID等)を確認した上で手動で
+    削除すること。
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = _state_path(symbol).with_suffix(".lock")
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as exc:
+        raise RuntimeError(
+            f"another process may already be managing {symbol} "
+            f"(lock file exists: {lock_path}; delete it manually if you're sure no other run is active)"
+        ) from exc
+    try:
+        os.write(fd, f"{os.getpid()} {datetime.now(timezone.utc).isoformat()}".encode())
+        os.close(fd)
+        yield
+    finally:
+        lock_path.unlink(missing_ok=True)
 
 
 def within_cooldown(state: dict, min_hold_days: float) -> bool:
@@ -66,6 +112,130 @@ def within_cooldown(state: dict, min_hold_days: float) -> bool:
         return False
     last = datetime.fromisoformat(state["last_action_at"])
     return datetime.now(timezone.utc) - last < timedelta(days=min_hold_days)
+
+
+def _clear_position_state(state: dict) -> None:
+    state.update(
+        {
+            "status": "flat",
+            "spot_amount": None,
+            "perp_amount": None,
+            "spot_order_id": None,
+            "perp_order_id": None,
+            "last_error": None,
+            "needs_manual_intervention": False,
+        }
+    )
+
+
+def _run(args: argparse.Namespace) -> None:
+    dry_run = not args.live
+    state = load_state(args.symbol)
+
+    if state["needs_manual_intervention"]:
+        print(
+            f"BLOCKED: {args.symbol} state requires manual intervention "
+            f"(last_error={state.get('last_error')!r}). Check the exchange and state file before retrying."
+        )
+        return
+
+    if not dry_run:
+        matches, message = reconcile_state(
+            args.symbol,
+            expected_status=state["status"],
+            expected_spot_amount=state.get("spot_amount"),
+            expected_perp_amount=state.get("perp_amount"),
+        )
+        print(f"reconcile: {message}")
+        if not matches:
+            state["needs_manual_intervention"] = True
+            state["last_error"] = message
+            save_state(args.symbol, state)
+            print("BLOCKED: state/exchange mismatch. Stopping before placing any order.")
+            return
+
+    # spot_onlyは「先物は閉じたが現物売却が残った」ような復旧待ちの状態。
+    # 新しいエントリー判断をする前にまずこれを片付けないと、現物ポジションが
+    # 二重に積み上がってしまう。
+    if state["status"] == "spot_only":
+        print("recovery: residual spot-only position detected; retrying spot close")
+        result = close_spot_only(args.symbol, dry_run=dry_run)
+        if result.spot_filled:
+            _clear_position_state(state)
+            state["last_action_at"] = datetime.now(timezone.utc).isoformat()
+            if not dry_run:
+                save_state(args.symbol, state)
+            print("recovery complete: state=flat")
+        else:
+            state["last_error"] = "; ".join(result.errors)
+            state["needs_manual_intervention"] = result.needs_manual_intervention
+            if not dry_run:
+                save_state(args.symbol, state)
+            print(f"recovery failed: {result.errors}")
+        return
+
+    perp_symbol = f"{args.symbol}:USDT"
+    funding = fetch_funding_rate(perp_symbol, total_records=WINDOW)
+    if len(funding) < WINDOW:
+        raise RuntimeError(f"insufficient funding history: expected {WINDOW} records, got {len(funding)}")
+    trailing_avg = float(funding["funding_rate"].iloc[-WINDOW:].mean())
+
+    currently_positioned = state["status"] == "carry"
+    decision = decide_carry_action(trailing_avg, currently_positioned=currently_positioned)
+
+    print(f"{args.symbol}: trailing {WINDOW * 8}h funding avg = {trailing_avg:+.4%}/interval")
+    print(f"status={state['status']} raw_decision={decision.action} ({decision.reason})")
+    if decision.action in ("enter", "exit") and within_cooldown(state, args.min_hold_days):
+        print(f"cooldown active (min_hold_days={args.min_hold_days}): overriding to hold/stay_flat")
+        decision.action = "hold" if currently_positioned else "stay_flat"
+
+    print(f"final decision: {decision.action}")
+
+    if decision.action == "enter":
+        result = place_carry_orders(args.symbol, args.notional, dry_run=dry_run)
+        if result.fully_positioned:
+            state.update(
+                status="carry",
+                spot_amount=result.spot_amount or None,
+                perp_amount=result.perp_amount or None,
+                spot_order_id=result.spot_order_id,
+                perp_order_id=result.perp_order_id,
+                last_action_at=datetime.now(timezone.utc).isoformat(),
+                last_error=None,
+            )
+        elif result.needs_manual_intervention:
+            state.update(
+                status="spot_only" if result.spot_filled and not result.perp_filled else state["status"],
+                spot_amount=result.spot_amount or state.get("spot_amount"),
+                perp_amount=result.perp_amount or state.get("perp_amount"),
+                spot_order_id=result.spot_order_id,
+                perp_order_id=result.perp_order_id,
+                needs_manual_intervention=True,
+                last_error="; ".join(result.errors),
+            )
+        if result.errors:
+            print(f"errors: {result.errors}")
+
+    elif decision.action == "exit":
+        result = close_carry_orders(args.symbol, args.notional, dry_run=dry_run)
+        if result.fully_positioned:
+            _clear_position_state(state)
+            state["last_action_at"] = datetime.now(timezone.utc).isoformat()
+        elif result.perp_filled and not result.spot_filled:
+            state["status"] = "spot_only"  # 先物は閉じた、現物売却は次回再試行
+            state["perp_amount"] = None
+            state["perp_order_id"] = result.perp_order_id
+            state["last_error"] = "; ".join(result.errors)
+        elif result.needs_manual_intervention:
+            state["needs_manual_intervention"] = True
+            state["last_error"] = "; ".join(result.errors)
+        if result.errors:
+            print(f"errors: {result.errors}")
+    else:
+        print("no order needed")
+
+    if not dry_run:
+        save_state(args.symbol, state)
 
 
 def main() -> None:
@@ -80,75 +250,16 @@ def main() -> None:
         help="直近のenter/exitからこの日数が経つまでは反対方向のアクションを取らない(頻繁な出し入れによるコスト負けを防ぐ)",
     )
     args = parser.parse_args()
-    dry_run = not args.live
+    if args.notional <= 0:
+        parser.error("--notional must be positive")
+    if args.min_hold_days < 0:
+        parser.error("--min-hold-days must be non-negative")
 
-    state = load_state(args.symbol)
-
-    if state["needs_manual_intervention"]:
-        print(
-            f"BLOCKED: {args.symbol} state requires manual intervention "
-            f"(last_error={state.get('last_error')!r}). "
-            f"Check the exchange manually, fix live/state/{args.symbol.replace('/', '-')}.json, then retry."
-        )
-        return
-
-    if not dry_run:
-        matches, message = reconcile_state(args.symbol, state_positioned=(state["status"] == "carry"))
-        print(f"reconcile: {message}")
-        if not matches:
-            state["needs_manual_intervention"] = True
-            state["last_error"] = message
-            save_state(args.symbol, state)
-            print("BLOCKED: state/exchange mismatch. Stopping before placing any order.")
-            return
-
-    perp_symbol = f"{args.symbol}:USDT"
-    funding = fetch_funding_rate(perp_symbol, total_records=WINDOW)
-    trailing_avg = funding["funding_rate"].mean()
-
-    currently_positioned = state["status"] == "carry"
-    decision = decide_carry_action(trailing_avg, currently_positioned=currently_positioned)
-
-    print(f"{args.symbol}: trailing {WINDOW * 8}h funding avg = {trailing_avg:+.4%}/interval")
-    print(f"status={state['status']} raw_decision={decision.action} ({decision.reason})")
-
-    if decision.action in ("enter", "exit") and within_cooldown(state, args.min_hold_days):
-        print(f"cooldown active (min_hold_days={args.min_hold_days}): overriding to hold/stay_flat")
-        decision.action = "hold" if currently_positioned else "stay_flat"
-
-    print(f"final decision: {decision.action}")
-
-    if decision.action == "enter":
-        result = place_carry_orders(args.symbol, args.notional, dry_run=dry_run)
-        if result.fully_positioned:
-            state["status"] = "carry"
-            state["last_action_at"] = datetime.now(timezone.utc).isoformat()
-        elif result.needs_manual_intervention:
-            state["status"] = "spot_only"
-            state["needs_manual_intervention"] = True
-            state["last_error"] = "; ".join(result.errors)
-        # 何も約定しなかった/巻き戻して元通り(flat)になった場合はstateを変更しない
-        if result.errors:
-            print(f"errors: {result.errors}")
-    elif decision.action == "exit":
-        result = close_carry_orders(args.symbol, args.notional, dry_run=dry_run)
-        if result.fully_positioned:
-            state["status"] = "flat"
-            state["last_action_at"] = datetime.now(timezone.utc).isoformat()
-        elif result.perp_filled and not result.spot_filled:
-            state["status"] = "spot_only"  # 先物は閉じたが現物売却が失敗、低リスクなので次回再試行
-            state["last_error"] = "; ".join(result.errors)
-        elif result.needs_manual_intervention:
-            # 先物の買い戻し自体が失敗し、レバレッジのかかったショートがまだ残っている
-            state["needs_manual_intervention"] = True
-            state["last_error"] = "; ".join(result.errors)
-        if result.errors:
-            print(f"errors: {result.errors}")
+    if args.live:
+        with state_lock(args.symbol):
+            _run(args)
     else:
-        print("no order needed")
-
-    if not dry_run:
-        save_state(args.symbol, state)
+        _run(args)
 
 
 if __name__ == "__main__":

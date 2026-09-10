@@ -16,7 +16,7 @@ from typing import Callable
 
 import pandas as pd
 
-from backtest import BacktestResult, run_backtest
+from backtest import BacktestResult, max_drawdown_from_returns, run_backtest
 
 
 @dataclass
@@ -45,9 +45,7 @@ class WalkForwardReport:
             if self.combined_returns.std() > 0
             else 0.0
         )
-        running_max = equity_curve.cummax()
-        drawdown = equity_curve / running_max - 1 if len(equity_curve) else pd.Series(dtype=float)
-        max_drawdown = float(drawdown.min()) if len(drawdown) else 0.0
+        max_drawdown = max_drawdown_from_returns(self.combined_returns)
         return BacktestResult(
             equity_curve=equity_curve,
             returns=self.combined_returns,

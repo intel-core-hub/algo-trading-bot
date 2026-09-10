@@ -51,3 +51,27 @@ def test_no_extra_closing_cost_when_already_flat_at_end():
     # entry + exit only - no forced close since position is already 0 at the end
     assert result.n_trades == 2
     assert result.returns.iloc[-1] == 0.0
+
+
+def test_win_rate_is_computed_per_closed_trade_not_per_positive_bar():
+    # One trade: two winning holding bars (+10%, +10%) followed by an exit bar
+    # that loses roughly 50%. Most of the *bars* while positioned were positive,
+    # but the entry->exit trade itself is a clear loser, so win_rate must be 0%.
+    close = pd.Series([100.0, 110.0, 121.0, 60.0], index=_hourly_index(4))
+    signal = pd.Series([1.0, 1.0, 1.0, 0.0], index=close.index)
+
+    result = run_backtest(close, signal, fee_bps=0.0, slippage_bps=0.0)
+
+    assert result.win_rate == 0.0
+
+
+def test_win_rate_counts_each_reversal_as_a_separate_trade():
+    # trade 1: long from bar0, reversed to short at bar2 (a losing long trade:
+    # 100->90 while long). trade 2: short from bar2, closed flat at bar3 on a
+    # further decline (a winning short trade: 90->80).
+    close = pd.Series([100.0, 100.0, 90.0, 80.0], index=_hourly_index(4))
+    signal = pd.Series([1.0, 1.0, -1.0, 0.0], index=close.index)
+
+    result = run_backtest(close, signal, fee_bps=0.0, slippage_bps=0.0)
+
+    assert result.win_rate == 0.5
