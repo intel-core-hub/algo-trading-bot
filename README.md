@@ -339,4 +339,7 @@ python -m venv .venv
 ```
 
 APIキーが必要になった場合は `.env` に置く(gitignore済み)。マーケットデータ取得自体は
-公開エンドポイントのみを使うため、当面はAPIキー不要で進められる。
+公開エンドポイントのみを使うため、当面はAPIキー不要で進められる。テストネット発注
+(`live/check_and_trade_carry.py --live`)には`.env.example`をコピーして
+必要なキー名を確認し、Binance Spot/Futures両テストネットで発行したキーの値を
+自分で埋めること(`cp .env.example .env`)。

@@ -1,4 +1,30 @@
+import pytest
+
 import execution
+
+
+# --- _get_testnet_exchange: missing API keys must fail closed with a clear error ---
+
+
+@pytest.mark.parametrize(
+    "getter, key_env, secret_env",
+    [
+        (execution.get_testnet_spot_exchange, "BINANCE_TESTNET_SPOT_API_KEY", "BINANCE_TESTNET_SPOT_API_SECRET"),
+        (
+            execution.get_testnet_futures_exchange,
+            "BINANCE_TESTNET_FUTURES_API_KEY",
+            "BINANCE_TESTNET_FUTURES_API_SECRET",
+        ),
+    ],
+)
+def test_get_testnet_exchange_raises_clear_error_when_env_vars_missing(monkeypatch, getter, key_env, secret_env):
+    # .envが未設定/キー未発行のまま実行された場合、ccxtの認証エラーのような分かり
+    # にくい失敗ではなく、何を設定すべきかが分かるエラーで即座に落ちる必要がある。
+    monkeypatch.delenv(key_env, raising=False)
+    monkeypatch.delenv(secret_env, raising=False)
+
+    with pytest.raises(RuntimeError, match=key_env):
+        getter()
 
 
 class FakeSpotExchange:
