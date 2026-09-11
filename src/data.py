@@ -1,5 +1,7 @@
 """公開OHLCVデータの取得ユーティリティ(APIキー不要、取引所の公開エンドポイントのみ使用)。"""
 
+import json
+import urllib.request
 from pathlib import Path
 
 import ccxt
@@ -108,6 +110,46 @@ def fetch_and_cache_funding_rate(
     out_path = DATA_DIR / f"{exchange_id}_{safe_symbol}_funding.csv"
     df.to_csv(out_path)
     return out_path
+
+
+def fetch_bitflyer_funding_rate_history(
+    product_code: str = "FX_BTC_JPY",
+    total_records: int = 5000,
+) -> pd.DataFrame:
+    """bitFlyer Crypto CFDのfunding rate履歴を取得する(8時間ごと、認証不要のPublic API)。
+
+    符号の意味はBinanceの無期限先物と同じ: プラス=CFD価格が現物より高く、買い建玉の
+    保有者から売り建玉の保有者へ支払われる。このプロジェクトのキャリー戦略(現物ロング+
+    CFDショート)は売り建玉側なので、プラスのfunding rateを受け取る側になる。
+
+    ccxtはこのエンドポイントを公式サポートしていないため、標準ライブラリのurllibで
+    直接叩く(`GET /v1/getfundingratehistory`、`to`パラメータを直近の取得済み最古の
+    calculation_dateに設定してページングする)。
+    """
+    url = "https://api.bitflyer.com/v1/getfundingratehistory"
+    all_rows: list[dict] = []
+    seen: set[str] = set()
+    cursor: str | None = None
+    while len(all_rows) < total_records:
+        query = f"?product_code={product_code}&count=500"
+        if cursor:
+            query += f"&to={cursor}"
+        with urllib.request.urlopen(url + query) as resp:
+            batch = json.loads(resp.read())
+        if not batch:
+            break
+        new = [r for r in batch if r["calculation_date"] not in seen]
+        if not new:
+            break
+        seen.update(r["calculation_date"] for r in new)
+        all_rows.extend(new)
+        cursor = batch[-1]["calculation_date"]
+
+    df = pd.DataFrame(all_rows)
+    df["timestamp"] = pd.to_datetime(df["calculation_date"])
+    df["funding_rate"] = df["rate"].astype(float)
+    df = df.drop_duplicates(subset="timestamp").sort_values("timestamp")
+    return df.set_index("timestamp")[["funding_rate"]].tail(total_records)
 
 
 if __name__ == "__main__":
