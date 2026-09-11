@@ -14,6 +14,46 @@ mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 
 
+def test_state_lock_aborts_before_touching_exchange_when_already_locked(monkeypatch, tmp_path):
+    """Windows実機で、ロックファイルが既に存在する(=別プロセスが処理中)状態から
+    --liveで起動した場合に、reconcile_state等のAPIキーを要する処理へ進む前に
+    確実に中断されることを確認する(手元でstale lockを模した再現テスト)。"""
+    monkeypatch.setattr(mod, "STATE_DIR", tmp_path)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    lock_path = tmp_path / "BTC-USDT.lock"
+    lock_path.write_text("99999 stale")
+    monkeypatch.setattr(
+        mod, "reconcile_state", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not reach reconcile_state"))
+    )
+
+    try:
+        with mod.state_lock("BTC/USDT"):
+            raise AssertionError("must not enter the locked block")
+    except RuntimeError as exc:
+        assert "BTC/USDT" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError for an already-locked symbol")
+
+    # the pre-existing (stale) lock file must be left alone, not consumed by us
+    assert lock_path.read_text() == "99999 stale"
+
+
+def test_state_lock_releases_lock_even_when_wrapped_code_raises(monkeypatch, tmp_path):
+    monkeypatch.setattr(mod, "STATE_DIR", tmp_path)
+    lock_path = tmp_path / "BTC-USDT.lock"
+
+    try:
+        with mod.state_lock("BTC/USDT"):
+            assert lock_path.exists()
+            raise RuntimeError("boom")
+    except RuntimeError as exc:
+        assert str(exc) == "boom"
+    else:
+        raise AssertionError("expected the original exception to propagate")
+
+    assert not lock_path.exists()
+
+
 def test_spot_only_recovery_bypasses_funding_decision(monkeypatch, tmp_path):
     """spot_onlyの復旧は、資金調達率を取得したりcooldown判定をしたりする前に、
     他の何よりも優先して行われなければならない(そうしないと新規エントリーが
